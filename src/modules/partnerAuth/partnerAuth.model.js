@@ -1,0 +1,218 @@
+const db = require('../../config/db');
+
+class PartnerAuthModel {
+    static async ensureTable() {
+        const query = `
+      CREATE TABLE IF NOT EXISTS partners (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        mobile VARCHAR(20) NOT NULL UNIQUE,
+        country_code VARCHAR(6) DEFAULT '+91',
+        name VARCHAR(100) DEFAULT NULL,
+        rating DECIMAL(3,2) DEFAULT NULL,
+        experience VARCHAR(60) DEFAULT NULL,
+        avatar TEXT DEFAULT NULL,
+        kyc_status VARCHAR(20) DEFAULT 'pending',
+        status VARCHAR(20) DEFAULT 'active',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )
+    `;
+
+        await db.query(query);
+
+        // Forward-compatible migrations (ignore if column exists)
+        try {
+            await db.query("ALTER TABLE partners ADD COLUMN name VARCHAR(100) DEFAULT NULL");
+        } catch (_) {
+            // ignore
+        }
+
+        try {
+            await db.query("ALTER TABLE partners ADD COLUMN rating DECIMAL(3,2) DEFAULT NULL");
+        } catch (_) {
+            // ignore
+        }
+
+        try {
+            await db.query("ALTER TABLE partners ADD COLUMN experience VARCHAR(60) DEFAULT NULL");
+        } catch (_) {
+            // ignore
+        }
+
+        try {
+            await db.query("ALTER TABLE partners ADD COLUMN avatar TEXT DEFAULT NULL");
+        } catch (_) {
+            // ignore
+        }
+
+        try {
+            await db.query("ALTER TABLE partners ADD COLUMN status VARCHAR(20) DEFAULT 'active'");
+        } catch (_) {
+            // ignore
+        }
+
+        try {
+            await db.query("ALTER TABLE partners ADD COLUMN kyc_status VARCHAR(20) DEFAULT 'pending'");
+        } catch (_) {
+            // ignore
+        }
+
+        try {
+            await db.query(
+                "ALTER TABLE partners ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"
+            );
+        } catch (_) {
+            // ignore
+        }
+
+        try {
+            await db.query("ALTER TABLE partners DROP COLUMN fcm_token");
+        } catch (_) {
+            // ignore
+        }
+
+        try {
+            await db.query("ALTER TABLE partners ADD COLUMN expo_push_token VARCHAR(255) DEFAULT NULL");
+        } catch (_) {
+            // ignore
+        }
+
+        // UPI verification columns
+        try {
+            await db.query("ALTER TABLE partners ADD COLUMN upi_id VARCHAR(100) DEFAULT NULL");
+        } catch (_) {
+            // ignore - column may already exist
+        }
+
+        try {
+            await db.query("ALTER TABLE partners ADD COLUMN upi_verified BOOLEAN DEFAULT false");
+        } catch (_) {
+            // ignore - column may already exist
+        }
+
+        try {
+            await db.query("ALTER TABLE partners ADD COLUMN upi_verified_at DATETIME DEFAULT NULL");
+        } catch (_) {
+            // ignore - column may already exist
+        }
+
+        const createOtpTableQuery = `
+            CREATE TABLE IF NOT EXISTS partner_otp (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                mobile VARCHAR(20) NOT NULL,
+                otp VARCHAR(10) NOT NULL,
+                expires_at TIMESTAMP NOT NULL,
+                verified BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `;
+        await db.query(createOtpTableQuery);
+    }
+
+    static async findByMobile(mobile) {
+        const [rows] = await db.query('SELECT * FROM partners WHERE mobile = ? LIMIT 1', [mobile]);
+        return rows.length ? rows[0] : null;
+    }
+
+    static async findById(id) {
+        const [rows] = await db.query(
+            'SELECT id, mobile, country_code, name, rating, experience, avatar, kyc_status, status, upi_id, upi_verified, upi_verified_at, created_at, updated_at FROM partners WHERE id = ? LIMIT 1',
+            [id]
+        );
+        return rows.length ? rows[0] : null;
+    }
+
+    static async findByIdWithKyc(id) {
+        const [rows] = await db.query(
+            `
+              SELECT
+                p.id,
+                p.mobile,
+                p.country_code,
+                p.name,
+                p.rating,
+                p.experience,
+                p.avatar,
+                p.kyc_status,
+                p.status,
+                p.upi_id,
+                p.upi_verified,
+                p.upi_verified_at,
+                p.created_at,
+                p.updated_at,
+                pk.partner_type,
+                pk.full_name AS kyc_full_name,
+                pk.service_area,
+                pk.service_latitude,
+                pk.service_longitude,
+                pk.experience AS kyc_experience,
+                pk.skills,
+                pk.salon_name,
+                pk.salon_address,
+                pk.salon_latitude,
+                pk.salon_longitude,
+                pk.salon_logo,
+                pk.salon_gallery,
+                pk.opening_time,
+                pk.closing_time,
+                pk.aadhaar_url,
+                pk.pan_url,
+                pk.certificate_url,
+                pk.selfie_url,
+                pk.kyc_status AS kyc_record_status,
+                pk.submit_count AS kyc_submit_count,
+                pk.id AS kyc_id
+              FROM partners p
+              LEFT JOIN partner_kyc pk ON pk.partner_id = p.id
+              WHERE p.id = ?
+              LIMIT 1
+            `,
+            [id]
+        );
+        return rows.length ? rows[0] : null;
+    }
+
+    static async createPartner({ mobile, countryCode }) {
+        const [result] = await db.query(
+            'INSERT INTO partners (mobile, country_code, kyc_status) VALUES (?, ?, ?)',
+            [mobile, countryCode || '+91', 'pending']
+        );
+        return result.insertId;
+    }
+
+    // --- OTP Methods ---
+
+    static async saveOtp(mobile, otp, expiresAt) {
+        const [result] = await db.query(
+            'INSERT INTO partner_otp (mobile, otp, expires_at) VALUES (?, ?, ?)',
+            [mobile, otp, expiresAt]
+        );
+        return result.insertId;
+    }
+
+    static async findOtp(mobile, otp) {
+        const [rows] = await db.query(
+            'SELECT * FROM partner_otp WHERE mobile = ? AND otp = ? AND verified = FALSE ORDER BY created_at DESC LIMIT 1',
+            [mobile, otp]
+        );
+        return rows.length ? rows[0] : null;
+    }
+
+    static async markOtpVerified(id) {
+        await db.query('UPDATE partner_otp SET verified = TRUE WHERE id = ?', [id]);
+    }
+
+    static async invalidateOldOtps(mobile) {
+        await db.query('UPDATE partner_otp SET verified = TRUE WHERE mobile = ? AND verified = FALSE', [mobile]);
+    }
+
+    static async countRecentOtps(mobile, minutes) {
+        const [rows] = await db.query(
+            'SELECT COUNT(*) as count FROM partner_otp WHERE mobile = ? AND created_at >= NOW() - INTERVAL ? MINUTE',
+            [mobile, minutes]
+        );
+        return rows[0].count;
+    }
+}
+
+module.exports = PartnerAuthModel;
