@@ -19,10 +19,19 @@ const emitBannerUpdated = (payload) => {
   }
 };
 
-const buildFileUrl = (req, relPath) => {
-  if (!relPath) return null;
-  return `${req.protocol}://${req.get('host')}/${String(relPath).replace(/\\/g, '/')}`;
-};
+// const buildFileUrl = (req, relPath) => {
+//   if (!relPath) return null;
+//   return `${req.protocol}://${req.get('host')}/${String(relPath).replace(/\\/g, '/')}`;
+// };
+function buildFileUrl(req, relPath) {
+    if (!relPath) return null;
+
+    const protocol =
+        req.headers["x-forwarded-proto"]?.split(",")[0] ||
+        req.protocol;
+
+    return `${protocol}://${req.get("host")}/${String(relPath).replace(/\\/g, "/")}`;
+}
 
 const toPublicBanner = (req, row) => {
   if (!row) return row;
