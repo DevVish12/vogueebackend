@@ -27,7 +27,7 @@ const start = async () => {
         const app = require('./src/app');
 
         // Static uploads (proof images, etc.)
-        app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+        // app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
         // Ensure tables via their models
         const AdminAuthModel = require('./src/modules/adminAuth/adminAuth.model');

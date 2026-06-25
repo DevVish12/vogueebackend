@@ -31,7 +31,7 @@ const salonRoutes = require('./modules/salon/salon.route');
 const { reviewRoutes, adminReviewRoutes } = require('./modules/reviews/review.routes');
 
 const app = express();
-
+app.set("trust proxy", 1);
 const publicCategoryRoutes = require('./modules/category/category.public.route');
 const publicServiceRoutes = require('./modules/service/service.public.route');
 
