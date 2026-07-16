@@ -1,8 +1,17 @@
+
+
 // const UserAuthModel = require('./userAuth.model');
 // const { generateToken } = require('../../utils/jwt');
 // const { sendNimbusSms } = require('../../utils/sms');
 
 // const normalizeMobile = (value) => String(value || '').replace(/\D/g, '').slice(-10);
+// const isEnvTrue = (value) => String(value || '').trim().toLowerCase() === 'true';
+
+// const getGooglePlayReviewConfig = () => ({
+//     enabled: isEnvTrue(process.env.GOOGLE_PLAY_REVIEW_ENABLED),
+//     phone: normalizeMobile(process.env.GOOGLE_PLAY_REVIEW_PHONE),
+//     otp: String(process.env.GOOGLE_PLAY_REVIEW_OTP || '').trim()
+// });
 
 // class UserAuthService {
 //     static async devLogin({ mobile, countryCode }) {
@@ -30,6 +39,21 @@
 
 //     static async sendOtp({ mobile, countryCode }) {
 //         const cleanMobile = normalizeMobile(mobile);
+//         const reviewConfig = getGooglePlayReviewConfig();
+
+//         if (reviewConfig.enabled && cleanMobile === reviewConfig.phone) {
+//             console.log('[GOOGLE PLAY REVIEW LOGIN]');
+//             console.log('Review account detected');
+//             console.log('Skipping Nimbus SMS');
+//             console.log(`[GOOGLE PLAY REVIEW OTP] Phone: +91${cleanMobile}, OTP: ${reviewConfig.otp}`);
+
+//             return {
+//                 success: true,
+//                 message: 'OTP sent successfully',
+//                 reviewAccount: true,
+//                 prepared: true
+//             };
+//         }
 
 //         // Rate limiting: Max 5 OTPs per 15 minutes
 //         const recentCount = await UserAuthModel.countRecentOtps(cleanMobile, 15);
@@ -65,8 +89,24 @@
 
 //     static async verifyOtp({ mobile, otp }) {
 //         const cleanMobile = normalizeMobile(mobile);
+//         const cleanOtp = String(otp || '').trim();
+//         const reviewConfig = getGooglePlayReviewConfig();
 
-//         const otpRecord = await UserAuthModel.findOtp(cleanMobile, otp);
+//         if (reviewConfig.enabled && cleanMobile === reviewConfig.phone && cleanOtp === reviewConfig.otp) {
+//             console.log('[GOOGLE PLAY REVIEW LOGIN]');
+//             console.log('Review OTP accepted');
+
+//             const data = await this.devLogin({ mobile: cleanMobile });
+
+//             console.log('Review user logged in');
+
+//             return {
+//                 ...data,
+//                 reviewAccount: true
+//             };
+//         }
+
+//         const otpRecord = await UserAuthModel.findOtp(cleanMobile, cleanOtp);
 
 //         if (!otpRecord) {
 //             console.log(`[OTP VERIFY FAILED] Mobile: ${cleanMobile}, Reason: Invalid OTP`);
@@ -120,12 +160,33 @@
 // module.exports = UserAuthService;
 
 
+const fs = require('fs/promises');
+const path = require('path');
+const db = require('../../config/db');
 const UserAuthModel = require('./userAuth.model');
 const { generateToken } = require('../../utils/jwt');
 const { sendNimbusSms } = require('../../utils/sms');
 
 const normalizeMobile = (value) => String(value || '').replace(/\D/g, '').slice(-10);
 const isEnvTrue = (value) => String(value || '').trim().toLowerCase() === 'true';
+
+const safeUnlink = async (relativePathValue) => {
+    const raw = String(relativePathValue || '').trim();
+    if (!raw || /^https?:\/\//i.test(raw) || /^file:\/\//i.test(raw)) {
+        return;
+    }
+
+    const normalized = raw.replace(/^\/+/, '').replace(/\\/g, '/');
+    const absolutePath = path.resolve(__dirname, '../../../', normalized);
+
+    try {
+        await fs.unlink(absolutePath);
+    } catch (error) {
+        if (error?.code !== 'ENOENT') {
+            console.warn('[USER ACCOUNT DELETE] Failed to remove file:', absolutePath, error?.message || error);
+        }
+    }
+};
 
 const getGooglePlayReviewConfig = () => ({
     enabled: isEnvTrue(process.env.GOOGLE_PLAY_REVIEW_ENABLED),
@@ -274,6 +335,70 @@ class UserAuthService {
         await UserAuthModel.updateAvatar(userId, avatar);
         const updated = await UserAuthModel.findById(userId);
         return { user: updated, avatar };
+    }
+
+    static async deleteAccount({ userId, ip, device }) {
+        const id = Number(userId);
+        if (!Number.isFinite(id) || id <= 0) {
+            const error = new Error('Invalid user id');
+            error.statusCode = 400;
+            throw error;
+        }
+
+        const conn = await db.getConnection();
+        let user = null;
+
+        try {
+            await conn.beginTransaction();
+
+            user = await UserAuthModel.findById(id, conn);
+            if (!user) {
+                const error = new Error('User not found');
+                error.statusCode = 404;
+                throw error;
+            }
+
+            await conn.query(
+                `
+                UPDATE users
+                SET
+                  name = NULL,
+                  email = NULL,
+                  gender = NULL,
+                  city = NULL,
+                  avatar = NULL,
+                  expo_push_token = NULL,
+                  status = 'deleted',
+                  updated_at = NOW()
+                WHERE id = ?
+                `,
+                [id]
+            );
+
+            await conn.query('DELETE FROM user_otp WHERE mobile = ?', [user.mobile]);
+
+            await conn.commit();
+        } catch (error) {
+            try {
+                await conn.rollback();
+            } catch {
+                // ignore
+            }
+            throw error;
+        } finally {
+            conn.release();
+        }
+
+        await safeUnlink(user?.avatar);
+
+        console.log('[USER ACCOUNT DELETE]', {
+            userId: id,
+            deletedTime: new Date().toISOString(),
+            ip: ip || null,
+            device: device || null,
+        });
+
+        return { success: true };
     }
 }
 
