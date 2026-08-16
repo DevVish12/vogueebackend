@@ -1,3 +1,5 @@
+
+
 // const db = require('../../config/db');
 
 // class PartnerAuthModel {
@@ -5,7 +7,7 @@
 //         const query = `
 //       CREATE TABLE IF NOT EXISTS partners (
 //         id INT AUTO_INCREMENT PRIMARY KEY,
-//         mobile VARCHAR(20) NOT NULL UNIQUE,
+//                 mobile VARCHAR(20) NOT NULL,
 //         country_code VARCHAR(6) DEFAULT '+91',
 //         name VARCHAR(100) DEFAULT NULL,
 //         rating DECIMAL(3,2) DEFAULT NULL,
@@ -19,6 +21,28 @@
 //     `;
 
 //         await db.query(query);
+
+//         // Allow re-registration with the same mobile after soft delete.
+//         try {
+//             const [indexes] = await db.query("SHOW INDEX FROM partners WHERE Column_name = 'mobile'");
+//             for (const index of indexes || []) {
+//                 if (Number(index?.Non_unique) === 0 && index?.Key_name) {
+//                     try {
+//                         await db.query(`ALTER TABLE partners DROP INDEX ${index.Key_name}`);
+//                     } catch (_) {
+//                         // ignore
+//                     }
+//                 }
+//             }
+//         } catch (_) {
+//             // ignore
+//         }
+
+//         try {
+//             await db.query('CREATE INDEX idx_partners_mobile ON partners (mobile)');
+//         } catch (_) {
+//             // ignore
+//         }
 
 //         // Forward-compatible migrations (ignore if column exists)
 //         try {
@@ -109,21 +133,30 @@
 //         await db.query(createOtpTableQuery);
 //     }
 
-//     static async findByMobile(mobile) {
-//         const [rows] = await db.query('SELECT * FROM partners WHERE mobile = ? LIMIT 1', [mobile]);
+//     static async findByMobile(mobile, conn = db) {
+//         const [rows] = await conn.query(
+//             `
+//             SELECT *
+//             FROM partners
+//             WHERE mobile = ?
+//             ORDER BY CASE WHEN LOWER(COALESCE(status, '')) = 'active' THEN 0 ELSE 1 END, created_at DESC, id DESC
+//             LIMIT 1
+//             `,
+//             [mobile]
+//         );
 //         return rows.length ? rows[0] : null;
 //     }
 
-//     static async findById(id) {
-//         const [rows] = await db.query(
+//     static async findById(id, conn = db) {
+//         const [rows] = await conn.query(
 //             'SELECT id, mobile, country_code, name, rating, experience, avatar, kyc_status, status, upi_id, upi_verified, upi_verified_at, created_at, updated_at FROM partners WHERE id = ? LIMIT 1',
 //             [id]
 //         );
 //         return rows.length ? rows[0] : null;
 //     }
 
-//     static async findByIdWithKyc(id) {
-//         const [rows] = await db.query(
+//     static async findByIdWithKyc(id, conn = db) {
+//         const [rows] = await conn.query(
 //             `
 //               SELECT
 //                 p.id,
@@ -218,7 +251,13 @@
 // module.exports = PartnerAuthModel;
 
 
+const crypto = require('crypto');
 const db = require('../../config/db');
+
+const hashRefreshToken = (refreshToken) => {
+    if (!refreshToken) return null;
+    return crypto.createHash('sha256').update(String(refreshToken)).digest('hex');
+};
 
 class PartnerAuthModel {
     static async ensureTable() {
@@ -349,6 +388,22 @@ class PartnerAuthModel {
             )
         `;
         await db.query(createOtpTableQuery);
+
+        const createPartnerSessionsTableQuery = `
+            CREATE TABLE IF NOT EXISTS partner_sessions (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                partner_id INT NOT NULL,
+                refresh_token_hash VARCHAR(128) NOT NULL,
+                expires_at TIMESTAMP NOT NULL,
+                revoked_at TIMESTAMP NULL DEFAULT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                INDEX idx_partner_sessions_partner_id (partner_id),
+                INDEX idx_partner_sessions_refresh_hash (refresh_token_hash),
+                CONSTRAINT fk_partner_sessions_partner FOREIGN KEY (partner_id) REFERENCES partners(id) ON DELETE CASCADE
+            )
+        `;
+        await db.query(createPartnerSessionsTableQuery);
     }
 
     static async findByMobile(mobile, conn = db) {
@@ -463,6 +518,68 @@ class PartnerAuthModel {
             [mobile, minutes]
         );
         return rows[0].count;
+    }
+
+    static async createSession(partnerId, refreshToken) {
+        const tokenHash = hashRefreshToken(refreshToken);
+        if (!tokenHash) return null;
+
+        const refreshLifetimeMs = Number(process.env.JWT_REFRESH_EXPIRES_IN_DAYS || 30) * 24 * 60 * 60 * 1000;
+        const expiresAt = new Date(Date.now() + refreshLifetimeMs);
+        const [result] = await db.query(
+            'INSERT INTO partner_sessions (partner_id, refresh_token_hash, expires_at, created_at, updated_at) VALUES (?, ?, ?, NOW(), NOW())',
+            [partnerId, tokenHash, expiresAt]
+        );
+        return result.insertId;
+    }
+
+    static async findSessionForRefreshToken(refreshToken) {
+        const tokenHash = hashRefreshToken(refreshToken);
+        if (!tokenHash) return null;
+
+        const [rows] = await db.query(
+            'SELECT * FROM partner_sessions WHERE refresh_token_hash = ? AND revoked_at IS NULL AND expires_at > NOW() ORDER BY created_at DESC LIMIT 1',
+            [tokenHash]
+        );
+        return rows[0] || null;
+    }
+
+    static async rotateSession(partnerId, oldRefreshToken, nextRefreshToken) {
+        const oldTokenHash = hashRefreshToken(oldRefreshToken);
+        const nextTokenHash = hashRefreshToken(nextRefreshToken);
+        if (!oldTokenHash || !nextTokenHash) return false;
+
+        const refreshLifetimeMs = Number(process.env.JWT_REFRESH_EXPIRES_IN_DAYS || 30) * 24 * 60 * 60 * 1000;
+        const expiresAt = new Date(Date.now() + refreshLifetimeMs);
+
+        const [result] = await db.query(
+            `UPDATE partner_sessions
+             SET refresh_token_hash = ?, expires_at = ?, revoked_at = NULL, updated_at = NOW()
+             WHERE partner_id = ? AND refresh_token_hash = ? AND revoked_at IS NULL AND expires_at > NOW()`,
+            [nextTokenHash, expiresAt, partnerId, oldTokenHash]
+        );
+
+        return Number(result.affectedRows || 0) > 0;
+    }
+
+    static async revokeSessionForUser(partnerId, refreshToken = null) {
+        if (refreshToken) {
+            const tokenHash = hashRefreshToken(refreshToken);
+            await db.query(
+                'UPDATE partner_sessions SET revoked_at = NOW(), updated_at = NOW() WHERE partner_id = ? AND refresh_token_hash = ? AND revoked_at IS NULL',
+                [partnerId, tokenHash]
+            );
+            return;
+        }
+
+        await db.query(
+            'UPDATE partner_sessions SET revoked_at = NOW(), updated_at = NOW() WHERE partner_id = ? AND revoked_at IS NULL',
+            [partnerId]
+        );
+    }
+
+    static async revokeAllSessionsForUser(partnerId) {
+        await this.revokeSessionForUser(partnerId);
     }
 }
 

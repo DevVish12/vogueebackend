@@ -1,11 +1,32 @@
 
 
+// const fs = require('fs/promises');
+// const path = require('path');
+// const db = require('../../config/db');
 // const UserAuthModel = require('./userAuth.model');
 // const { generateToken } = require('../../utils/jwt');
 // const { sendNimbusSms } = require('../../utils/sms');
 
 // const normalizeMobile = (value) => String(value || '').replace(/\D/g, '').slice(-10);
 // const isEnvTrue = (value) => String(value || '').trim().toLowerCase() === 'true';
+
+// const safeUnlink = async (relativePathValue) => {
+//     const raw = String(relativePathValue || '').trim();
+//     if (!raw || /^https?:\/\//i.test(raw) || /^file:\/\//i.test(raw)) {
+//         return;
+//     }
+
+//     const normalized = raw.replace(/^\/+/, '').replace(/\\/g, '/');
+//     const absolutePath = path.resolve(__dirname, '../../../', normalized);
+
+//     try {
+//         await fs.unlink(absolutePath);
+//     } catch (error) {
+//         if (error?.code !== 'ENOENT') {
+//             console.warn('[USER ACCOUNT DELETE] Failed to remove file:', absolutePath, error?.message || error);
+//         }
+//     }
+// };
 
 // const getGooglePlayReviewConfig = () => ({
 //     enabled: isEnvTrue(process.env.GOOGLE_PLAY_REVIEW_ENABLED),
@@ -155,6 +176,70 @@
 //         const updated = await UserAuthModel.findById(userId);
 //         return { user: updated, avatar };
 //     }
+
+//     static async deleteAccount({ userId, ip, device }) {
+//         const id = Number(userId);
+//         if (!Number.isFinite(id) || id <= 0) {
+//             const error = new Error('Invalid user id');
+//             error.statusCode = 400;
+//             throw error;
+//         }
+
+//         const conn = await db.getConnection();
+//         let user = null;
+
+//         try {
+//             await conn.beginTransaction();
+
+//             user = await UserAuthModel.findById(id, conn);
+//             if (!user) {
+//                 const error = new Error('User not found');
+//                 error.statusCode = 404;
+//                 throw error;
+//             }
+
+//             await conn.query(
+//                 `
+//                 UPDATE users
+//                 SET
+//                   name = NULL,
+//                   email = NULL,
+//                   gender = NULL,
+//                   city = NULL,
+//                   avatar = NULL,
+//                   expo_push_token = NULL,
+//                   status = 'deleted',
+//                   updated_at = NOW()
+//                 WHERE id = ?
+//                 `,
+//                 [id]
+//             );
+
+//             await conn.query('DELETE FROM user_otp WHERE mobile = ?', [user.mobile]);
+
+//             await conn.commit();
+//         } catch (error) {
+//             try {
+//                 await conn.rollback();
+//             } catch {
+//                 // ignore
+//             }
+//             throw error;
+//         } finally {
+//             conn.release();
+//         }
+
+//         await safeUnlink(user?.avatar);
+
+//         console.log('[USER ACCOUNT DELETE]', {
+//             userId: id,
+//             deletedTime: new Date().toISOString(),
+//             ip: ip || null,
+//             device: device || null,
+//         });
+
+//         return { success: true };
+//     }
 // }
 
 // module.exports = UserAuthService;
@@ -164,7 +249,7 @@ const fs = require('fs/promises');
 const path = require('path');
 const db = require('../../config/db');
 const UserAuthModel = require('./userAuth.model');
-const { generateToken } = require('../../utils/jwt');
+const { generateRefreshToken, generateToken } = require('../../utils/jwt');
 const { sendNimbusSms } = require('../../utils/sms');
 
 const normalizeMobile = (value) => String(value || '').replace(/\D/g, '').slice(-10);
@@ -195,6 +280,13 @@ const getGooglePlayReviewConfig = () => ({
 });
 
 class UserAuthService {
+    static async createSessionPayload(user) {
+        const token = generateToken({ id: user.id, role: user.role, mobile: user.mobile });
+        const refreshToken = generateRefreshToken();
+        await UserAuthModel.createSession(user.id, refreshToken);
+        return { token, refreshToken, user };
+    }
+
     static async devLogin({ mobile, countryCode }) {
         const cleanMobile = normalizeMobile(mobile);
 
@@ -209,11 +301,8 @@ class UserAuthService {
             user = await UserAuthModel.findById(user.id);
         }
 
-        const token = generateToken({ id: user.id, role: user.role, mobile: user.mobile });
-
         return {
-            user,
-            token,
+            ...await this.createSessionPayload(user),
             isNewUser
         };
     }
@@ -337,6 +426,48 @@ class UserAuthService {
         return { user: updated, avatar };
     }
 
+    static async refreshSession({ refreshToken }) {
+        if (!refreshToken) {
+            const error = new Error('Refresh token required');
+            error.statusCode = 401;
+            throw error;
+        }
+
+        const session = await UserAuthModel.findSessionForRefreshToken(refreshToken);
+        if (!session) {
+            const error = new Error('Session expired or revoked');
+            error.statusCode = 401;
+            throw error;
+        }
+
+        const user = await UserAuthModel.findById(session.user_id);
+        if (!user || String(user.status).toLowerCase() === 'deleted') {
+            const error = new Error('User session is invalid');
+            error.statusCode = 401;
+            throw error;
+        }
+
+        const nextRefreshToken = generateRefreshToken();
+        const rotated = await UserAuthModel.rotateSession(user.id, refreshToken, nextRefreshToken);
+        if (!rotated) {
+            const error = new Error('Session refresh failed');
+            error.statusCode = 401;
+            throw error;
+        }
+
+        const token = generateToken({ id: user.id, role: user.role, mobile: user.mobile });
+        return { token, refreshToken: nextRefreshToken, user };
+    }
+
+    static async logout({ userId, refreshToken = null }) {
+        if (!userId) {
+            return { success: true };
+        }
+
+        await UserAuthModel.revokeSessionForUser(userId, refreshToken || null);
+        return { success: true };
+    }
+
     static async deleteAccount({ userId, ip, device }) {
         const id = Number(userId);
         if (!Number.isFinite(id) || id <= 0) {
@@ -375,6 +506,7 @@ class UserAuthService {
                 [id]
             );
 
+            await UserAuthModel.revokeAllSessionsForUser(id);
             await conn.query('DELETE FROM user_otp WHERE mobile = ?', [user.mobile]);
 
             await conn.commit();

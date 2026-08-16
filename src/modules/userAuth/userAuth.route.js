@@ -1,3 +1,5 @@
+
+
 // const express = require('express');
 // const router = express.Router();
 // const UserAuthController = require('./userAuth.controller');
@@ -11,17 +13,22 @@
 // router.post('/send-otp', UserAuthController.sendOtp);
 // router.post('/resend-otp', UserAuthController.resendOtp);
 // router.post('/verify-otp', UserAuthController.verifyOtp);
+// router.post('/refresh', UserAuthController.refresh);
+// router.post('/logout', userProtect, UserAuthController.logout);
 
 // // Required profile completion (name + gender)
 // router.patch('/profile', userProtect, UserAuthController.updateProfile);
 
 // // Profile image upload (optional)
 // router.patch(
-// 	'/profile/image',
-// 	userProtect,
-// 	upload.single('avatar'),
-// 	UserAuthController.uploadProfileImage
+//     '/profile/image',
+//     userProtect,
+//     upload.single('avatar'),
+//     UserAuthController.uploadProfileImage
 // );
+
+// // Delete current user account
+// router.delete('/delete-account', userProtect, UserAuthController.deleteAccount);
 
 // module.exports = router;
 
@@ -39,16 +46,18 @@ router.post('/dev-login', UserAuthController.devLogin);
 router.post('/send-otp', UserAuthController.sendOtp);
 router.post('/resend-otp', UserAuthController.resendOtp);
 router.post('/verify-otp', UserAuthController.verifyOtp);
+router.post('/refresh', UserAuthController.refresh);
+router.post('/logout', userProtect, UserAuthController.logout);
 
 // Required profile completion (name + gender)
 router.patch('/profile', userProtect, UserAuthController.updateProfile);
 
 // Profile image upload (optional)
 router.patch(
-	'/profile/image',
-	userProtect,
-	upload.single('avatar'),
-	UserAuthController.uploadProfileImage
+    '/profile/image',
+    userProtect,
+    upload.single('avatar'),
+    UserAuthController.uploadProfileImage
 );
 
 // Delete current user account

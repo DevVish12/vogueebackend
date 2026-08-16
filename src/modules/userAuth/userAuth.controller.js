@@ -1,3 +1,5 @@
+
+
 // const UserAuthService = require('./userAuth.service');
 // const { devLoginSchema, updateProfileSchema, sendOtpSchema, verifyOtpSchema } = require('./userAuth.validation');
 // const { successResponse, errorResponse } = require('../../utils/response');
@@ -172,6 +174,19 @@
 //             next(err);
 //         }
 //     }
+
+//     static async deleteAccount(req, res, next) {
+//         try {
+//             const userId = req.user?.id;
+//             const device = req.headers['user-agent'] || req.headers['x-device-model'] || req.headers['x-device-name'] || null;
+//             const ip = req.headers['x-forwarded-for'] || req.ip || req.connection?.remoteAddress || null;
+
+//             const data = await UserAuthService.deleteAccount({ userId, ip: Array.isArray(ip) ? ip[0] : ip, device });
+//             return successResponse(res, 200, 'User account deleted successfully', data);
+//         } catch (err) {
+//             next(err);
+//         }
+//     }
 // }
 
 // module.exports = UserAuthController;
@@ -266,6 +281,26 @@ class UserAuthController {
                 }
             }
             return successResponse(res, 200, 'OTP verified successfully', data);
+        } catch (err) {
+            next(err);
+        }
+    }
+
+    static async refresh(req, res, next) {
+        try {
+            const { refreshToken } = req.body || {};
+            const data = await UserAuthService.refreshSession({ refreshToken });
+            return successResponse(res, 200, 'Session refreshed', data);
+        } catch (err) {
+            next(err);
+        }
+    }
+
+    static async logout(req, res, next) {
+        try {
+            const refreshToken = req.body?.refreshToken || req.headers['x-refresh-token'] || null;
+            const data = await UserAuthService.logout({ userId: req.user?.id, refreshToken });
+            return successResponse(res, 200, 'Logged out successfully', data);
         } catch (err) {
             next(err);
         }

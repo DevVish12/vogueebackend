@@ -1,3 +1,5 @@
+
+
 // const db = require('../../config/db');
 
 // class UserAuthModel {
@@ -70,8 +72,8 @@
 //         return rows.length ? rows[0] : null;
 //     }
 
-//     static async findById(id) {
-//         const [rows] = await db.query(
+//     static async findById(id, conn = db) {
+//         const [rows] = await conn.query(
 //             'SELECT id, mobile, country_code, name, email, gender, city, avatar, role, status, created_at, updated_at FROM users WHERE id = ?',
 //             [id]
 //         );
@@ -135,7 +137,14 @@
 // module.exports = UserAuthModel;
 
 
+
+const crypto = require('crypto');
 const db = require('../../config/db');
+
+const hashRefreshToken = (refreshToken) => {
+    if (!refreshToken) return null;
+    return crypto.createHash('sha256').update(String(refreshToken)).digest('hex');
+};
 
 class UserAuthModel {
     static async ensureTable() {
@@ -200,6 +209,22 @@ class UserAuthModel {
             )
         `;
         await db.query(createOtpTableQuery);
+
+        const createUserSessionsTableQuery = `
+            CREATE TABLE IF NOT EXISTS user_sessions (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id INT NOT NULL,
+                refresh_token_hash VARCHAR(128) NOT NULL,
+                expires_at TIMESTAMP NOT NULL,
+                revoked_at TIMESTAMP NULL DEFAULT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                INDEX idx_user_sessions_user_id (user_id),
+                INDEX idx_user_sessions_refresh_hash (refresh_token_hash),
+                CONSTRAINT fk_user_sessions_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        `;
+        await db.query(createUserSessionsTableQuery);
     }
 
     static async findByMobile(mobile) {
@@ -266,6 +291,72 @@ class UserAuthModel {
             [mobile, minutes]
         );
         return rows[0].count;
+    }
+
+    static async createSession(userId, refreshToken, sessionMeta = {}) {
+        const tokenHash = hashRefreshToken(refreshToken);
+        if (!tokenHash) return null;
+
+        const refreshLifetimeMs = Number(process.env.JWT_REFRESH_EXPIRES_IN_DAYS || 30) * 24 * 60 * 60 * 1000;
+        const expiresAt = new Date(Date.now() + refreshLifetimeMs);
+        const [result] = await db.query(
+            `
+            INSERT INTO user_sessions (user_id, refresh_token_hash, expires_at, created_at, updated_at)
+            VALUES (?, ?, ?, NOW(), NOW())
+            `,
+            [userId, tokenHash, expiresAt]
+        );
+
+        return result.insertId;
+    }
+
+    static async findSessionForRefreshToken(refreshToken) {
+        const tokenHash = hashRefreshToken(refreshToken);
+        if (!tokenHash) return null;
+
+        const [rows] = await db.query(
+            'SELECT * FROM user_sessions WHERE refresh_token_hash = ? AND revoked_at IS NULL AND expires_at > NOW() ORDER BY created_at DESC LIMIT 1',
+            [tokenHash]
+        );
+        return rows[0] || null;
+    }
+
+    static async rotateSession(userId, oldRefreshToken, nextRefreshToken) {
+        const oldTokenHash = hashRefreshToken(oldRefreshToken);
+        const nextTokenHash = hashRefreshToken(nextRefreshToken);
+        if (!oldTokenHash || !nextTokenHash) return false;
+
+        const refreshLifetimeMs = Number(process.env.JWT_REFRESH_EXPIRES_IN_DAYS || 30) * 24 * 60 * 60 * 1000;
+        const expiresAt = new Date(Date.now() + refreshLifetimeMs);
+
+        const [result] = await db.query(
+            `UPDATE user_sessions
+             SET refresh_token_hash = ?, expires_at = ?, revoked_at = NULL, updated_at = NOW()
+             WHERE user_id = ? AND refresh_token_hash = ? AND revoked_at IS NULL AND expires_at > NOW()`,
+            [nextTokenHash, expiresAt, userId, oldTokenHash]
+        );
+
+        return Number(result.affectedRows || 0) > 0;
+    }
+
+    static async revokeSessionForUser(userId, refreshToken = null) {
+        if (refreshToken) {
+            const tokenHash = hashRefreshToken(refreshToken);
+            await db.query(
+                'UPDATE user_sessions SET revoked_at = NOW(), updated_at = NOW() WHERE user_id = ? AND refresh_token_hash = ? AND revoked_at IS NULL',
+                [userId, tokenHash]
+            );
+            return;
+        }
+
+        await db.query(
+            'UPDATE user_sessions SET revoked_at = NOW(), updated_at = NOW() WHERE user_id = ? AND revoked_at IS NULL',
+            [userId]
+        );
+    }
+
+    static async revokeAllSessionsForUser(userId) {
+        await this.revokeSessionForUser(userId);
     }
 }
 
