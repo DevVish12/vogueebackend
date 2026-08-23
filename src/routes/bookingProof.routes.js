@@ -1,5 +1,6 @@
 
 
+
 // const express = require('express');
 // const path = require('path');
 // const fs = require('fs');
@@ -28,6 +29,7 @@
 // // POST /api/booking/upload-proof
 // router.post('/upload-proof', partnerProtect, upload.single('image'), async (req, res, next) => {
 //     try {
+//         console.log('[PROOF BACKEND] upload-proof request received');
 //         const { bookingId, notes } = req.body;
 //         const partnerId = req.partner?.id;
 
@@ -64,8 +66,7 @@
 //             [req.file.filename, notes || '', otp, id]
 //         );
 
-//         // eslint-disable-next-line no-console
-//         console.log('PROOF + OTP GENERATED:', otp);
+//         console.log('[PROOF BACKEND] upload-proof success');
 
 //         // 🔥 SOCKET EMIT TO USER
 //         try {
@@ -77,7 +78,7 @@
 //                     bookingId: String(booking.id),
 //                     proof_image: String(req.file.filename || ''),
 //                     notes: String(notes || ''),
-//                     otp: String(otp || '')
+//                     hasOtp: Boolean(otp)
 //                 });
 //             }
 //         } catch {
@@ -93,15 +94,21 @@
 //                 );
 //                 const userToken = userRows?.[0]?.expo_push_token;
 //                 if (userToken) {
-//                     await sendExpoNotification(
+//                     void sendExpoNotification(
 //                         userToken,
 //                         'Service Proof Received',
 //                         `We've received the proof for your ${booking.service_name} service. Please verify the OTP.`,
 //                         {
 //                             bookingId: booking.id,
-//                             type: 'serviceProofUploaded',
+//                             screen: 'BookingDetails',
+//                         },
+//                         {
+//                             type: 'SERVICE_PROOF_UPLOADED',
+//                             eventId: `booking_${booking.id}_PROOF_UPLOADED`,
+//                             recipientId: booking.user_id,
+//                             recipientRole: 'user',
 //                         }
-//                     );
+//                     ).catch(() => { });
 //                 }
 //             }
 //         } catch (err) {
@@ -130,7 +137,7 @@
 //             return res.status(400).json({ success: false, message: 'otp is required' });
 //         }
 
-//         const [rows] = await db.query('SELECT service_otp, user_id, service_name, partner_id FROM payments WHERE id = ?', [id]);
+//         const [rows] = await db.query('SELECT id, service_otp, user_id, service_name, partner_id, booking_status FROM payments WHERE id = ?', [id]);
 //         if (!rows || !rows.length) {
 //             return res.status(404).json({ success: false, message: 'Not found' });
 //         }
@@ -139,31 +146,60 @@
 //             return res.status(400).json({ success: false, message: 'Invalid OTP' });
 //         }
 
-//         await db.query(
+//         const [updateResult] = await db.query(
 //             `UPDATE payments
 //        SET booking_status = 'completed'
-//        WHERE id = ?`,
+//        WHERE id = ? AND booking_status <> 'completed'`,
 //             [id]
 //         );
 
-//         // Send notification to user that service is completed
+//         if (Number(updateResult?.affectedRows || 0) !== 1) {
+//             return res.json({ success: true, alreadyCompleted: true });
+//         }
+
+//         const booking = rows[0];
+//         const io = req.app.get('io');
+//         const completedPayload = { bookingId: id, status: 'completed', booking_status: 'completed' };
+//         if (io) {
+//             io.to(`user:${booking.user_id}`).emit('bookingStatusUpdate', completedPayload);
+//             io.to(`partner:${booking.partner_id}`).emit('bookingStatusUpdate', completedPayload);
+//         }
+
+//         // Push delivery is best-effort and must not affect completion success.
 //         try {
-//             const booking = rows[0];
 //             const [userRows] = await db.query(
-//                 'SELECT expo_push_token FROM users WHERE id = ?',
-//                 [booking.user_id]
+//                 `SELECT u.expo_push_token AS user_token, p.expo_push_token AS partner_token
+//                  FROM users u LEFT JOIN partners p ON p.id = ? WHERE u.id = ?`,
+//                 [booking.partner_id, booking.user_id]
 //             );
-//             const userToken = userRows?.[0]?.expo_push_token;
-//             if (userToken) {
-//                 await sendExpoNotification(
-//                     userToken,
+//             const recipient = userRows?.[0];
+//             if (recipient?.user_token) {
+//                 void sendExpoNotification(
+//                     recipient.user_token,
 //                     'Service Completed',
-//                     'Your service has been completed.',
+//                     'Your service has been completed successfully.',
+//                     { bookingId: id, screen: 'BookingHistory' },
 //                     {
-//                         bookingId: id,
-//                         type: 'serviceCompleted',
+//                         type: 'SERVICE_COMPLETED',
+//                         eventId: `booking_${id}_COMPLETED`,
+//                         recipientId: booking.user_id,
+//                         recipientRole: 'user',
 //                     }
-//                 );
+//                 ).catch(() => { });
+//             }
+//             if (recipient?.partner_token) {
+//                 void sendExpoNotification(
+//                     recipient.partner_token,
+//                     'Service Completed',
+//                     `Service for booking #${id} has been completed.`,
+//                     { bookingId: id, screen: 'BookingsOverview' },
+//                     {
+//                         type: 'SERVICE_COMPLETED',
+//                         eventId: `booking_${id}_COMPLETED`,
+//                         recipientId: booking.partner_id,
+//                         recipientRole: 'partner',
+//                     }
+//                 ).catch(() => { });
 //             }
 //         } catch (err) {
 //             // eslint-disable-next-line no-console
@@ -246,9 +282,6 @@ router.post('/upload-proof', partnerProtect, upload.single('image'), async (req,
 
         console.log('[PROOF BACKEND] upload-proof success');
 
-        // eslint-disable-next-line no-console
-        console.log('PROOF + OTP GENERATED:', otp);
-
         // 🔥 SOCKET EMIT TO USER
         try {
             const io = req.app.get('io');
@@ -259,7 +292,7 @@ router.post('/upload-proof', partnerProtect, upload.single('image'), async (req,
                     bookingId: String(booking.id),
                     proof_image: String(req.file.filename || ''),
                     notes: String(notes || ''),
-                    otp: String(otp || '')
+                    hasOtp: Boolean(otp)
                 });
             }
         } catch {
@@ -275,15 +308,21 @@ router.post('/upload-proof', partnerProtect, upload.single('image'), async (req,
                 );
                 const userToken = userRows?.[0]?.expo_push_token;
                 if (userToken) {
-                    await sendExpoNotification(
+                    void sendExpoNotification(
                         userToken,
                         'Service Proof Received',
                         `We've received the proof for your ${booking.service_name} service. Please verify the OTP.`,
                         {
                             bookingId: booking.id,
-                            type: 'serviceProofUploaded',
+                            screen: 'BookingDetails',
+                        },
+                        {
+                            type: 'SERVICE_PROOF_UPLOADED',
+                            eventId: `booking_${booking.id}_PROOF_UPLOADED`,
+                            recipientId: booking.user_id,
+                            recipientRole: 'user',
                         }
-                    );
+                    ).catch(() => { });
                 }
             }
         } catch (err) {
@@ -312,7 +351,7 @@ router.post('/verify-otp', async (req, res, next) => {
             return res.status(400).json({ success: false, message: 'otp is required' });
         }
 
-        const [rows] = await db.query('SELECT service_otp, user_id, service_name, partner_id FROM payments WHERE id = ?', [id]);
+        const [rows] = await db.query('SELECT id, service_otp, user_id, service_name, partner_id, booking_status, booking_type, service_mode FROM payments WHERE id = ?', [id]);
         if (!rows || !rows.length) {
             return res.status(404).json({ success: false, message: 'Not found' });
         }
@@ -321,31 +360,62 @@ router.post('/verify-otp', async (req, res, next) => {
             return res.status(400).json({ success: false, message: 'Invalid OTP' });
         }
 
-        await db.query(
+        const [updateResult] = await db.query(
             `UPDATE payments
        SET booking_status = 'completed'
-       WHERE id = ?`,
+       WHERE id = ? AND booking_status <> 'completed'`,
             [id]
         );
 
-        // Send notification to user that service is completed
+        if (Number(updateResult?.affectedRows || 0) !== 1) {
+            return res.json({ success: true, alreadyCompleted: true });
+        }
+
+        const booking = rows[0];
+        const isSalonVisit = String(booking.booking_type || '').trim() === 'visit_salon'
+            || String(booking.service_mode || '').trim() === 'visit_salon';
+        const io = req.app.get('io');
+        const completedPayload = { bookingId: id, status: 'completed', booking_status: 'completed' };
+        if (io) {
+            io.to(`user:${booking.user_id}`).emit('bookingStatusUpdate', completedPayload);
+            io.to(`partner:${booking.partner_id}`).emit('bookingStatusUpdate', completedPayload);
+        }
+
+        // Push delivery is best-effort and must not affect completion success.
         try {
-            const booking = rows[0];
             const [userRows] = await db.query(
-                'SELECT expo_push_token FROM users WHERE id = ?',
-                [booking.user_id]
+                `SELECT u.expo_push_token AS user_token, p.expo_push_token AS partner_token
+                 FROM users u LEFT JOIN partners p ON p.id = ? WHERE u.id = ?`,
+                [booking.partner_id, booking.user_id]
             );
-            const userToken = userRows?.[0]?.expo_push_token;
-            if (userToken) {
-                await sendExpoNotification(
-                    userToken,
+            const recipient = userRows?.[0];
+            if (recipient?.user_token) {
+                void sendExpoNotification(
+                    recipient.user_token,
                     'Service Completed',
-                    'Your service has been completed.',
+                    isSalonVisit ? 'Your salon service has been completed.' : 'Your service has been completed successfully.',
+                    { bookingId: id, screen: 'BookingHistory' },
                     {
-                        bookingId: id,
-                        type: 'serviceCompleted',
+                        type: isSalonVisit ? 'SALON_SERVICE_COMPLETED' : 'SERVICE_COMPLETED',
+                        eventId: `booking_${id}_COMPLETED`,
+                        recipientId: booking.user_id,
+                        recipientRole: 'user',
                     }
-                );
+                ).catch(() => { });
+            }
+            if (recipient?.partner_token) {
+                void sendExpoNotification(
+                    recipient.partner_token,
+                    'Service Completed',
+                    `Service for booking #${id} has been completed.`,
+                    { bookingId: id, screen: 'BookingsOverview' },
+                    {
+                        type: 'SERVICE_COMPLETED',
+                        eventId: `booking_${id}_COMPLETED`,
+                        recipientId: booking.partner_id,
+                        recipientRole: 'partner',
+                    }
+                ).catch(() => { });
             }
         } catch (err) {
             // eslint-disable-next-line no-console

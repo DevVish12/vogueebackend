@@ -1,10 +1,11 @@
 
 
+
 // const fs = require('fs/promises');
 // const path = require('path');
 // const db = require('../../config/db');
 // const UserAuthModel = require('./userAuth.model');
-// const { generateToken } = require('../../utils/jwt');
+// const { generateRefreshToken, generateToken } = require('../../utils/jwt');
 // const { sendNimbusSms } = require('../../utils/sms');
 
 // const normalizeMobile = (value) => String(value || '').replace(/\D/g, '').slice(-10);
@@ -35,6 +36,13 @@
 // });
 
 // class UserAuthService {
+//     static async createSessionPayload(user) {
+//         const token = generateToken({ id: user.id, role: user.role, mobile: user.mobile });
+//         const refreshToken = generateRefreshToken();
+//         await UserAuthModel.createSession(user.id, refreshToken);
+//         return { token, refreshToken, user };
+//     }
+
 //     static async devLogin({ mobile, countryCode }) {
 //         const cleanMobile = normalizeMobile(mobile);
 
@@ -49,11 +57,8 @@
 //             user = await UserAuthModel.findById(user.id);
 //         }
 
-//         const token = generateToken({ id: user.id, role: user.role, mobile: user.mobile });
-
 //         return {
-//             user,
-//             token,
+//             ...await this.createSessionPayload(user),
 //             isNewUser
 //         };
 //     }
@@ -177,6 +182,48 @@
 //         return { user: updated, avatar };
 //     }
 
+//     static async refreshSession({ refreshToken }) {
+//         if (!refreshToken) {
+//             const error = new Error('Refresh token required');
+//             error.statusCode = 401;
+//             throw error;
+//         }
+
+//         const session = await UserAuthModel.findSessionForRefreshToken(refreshToken);
+//         if (!session) {
+//             const error = new Error('Session expired or revoked');
+//             error.statusCode = 401;
+//             throw error;
+//         }
+
+//         const user = await UserAuthModel.findById(session.user_id);
+//         if (!user || String(user.status).toLowerCase() === 'deleted') {
+//             const error = new Error('User session is invalid');
+//             error.statusCode = 401;
+//             throw error;
+//         }
+
+//         const nextRefreshToken = generateRefreshToken();
+//         const rotated = await UserAuthModel.rotateSession(user.id, refreshToken, nextRefreshToken);
+//         if (!rotated) {
+//             const error = new Error('Session refresh failed');
+//             error.statusCode = 401;
+//             throw error;
+//         }
+
+//         const token = generateToken({ id: user.id, role: user.role, mobile: user.mobile });
+//         return { token, refreshToken: nextRefreshToken, user };
+//     }
+
+//     static async logout({ userId, refreshToken = null }) {
+//         if (!userId) {
+//             return { success: true };
+//         }
+
+//         await UserAuthModel.revokeSessionForUser(userId, refreshToken || null);
+//         return { success: true };
+//     }
+
 //     static async deleteAccount({ userId, ip, device }) {
 //         const id = Number(userId);
 //         if (!Number.isFinite(id) || id <= 0) {
@@ -215,6 +262,7 @@
 //                 [id]
 //             );
 
+//             await UserAuthModel.revokeAllSessionsForUser(id);
 //             await conn.query('DELETE FROM user_otp WHERE mobile = ?', [user.mobile]);
 
 //             await conn.commit();
@@ -315,7 +363,7 @@ class UserAuthService {
             console.log('[GOOGLE PLAY REVIEW LOGIN]');
             console.log('Review account detected');
             console.log('Skipping Nimbus SMS');
-            console.log(`[GOOGLE PLAY REVIEW OTP] Phone: +91${cleanMobile}, OTP: ${reviewConfig.otp}`);
+            console.log('[OTP] review OTP requested');
 
             return {
                 success: true,
@@ -335,7 +383,7 @@ class UserAuthService {
 
         // Generate 6 digit OTP
         const otp = Math.floor(100000 + Math.random() * 900000).toString();
-        console.log(`[OTP GENERATED] Mobile: ${cleanMobile}, OTP: ${otp}`);
+        console.log('[OTP] generated successfully');
 
         // Invalidate old OTPs
         await UserAuthModel.invalidateOldOtps(cleanMobile);
@@ -345,7 +393,7 @@ class UserAuthService {
 
         // Save OTP
         await UserAuthModel.saveOtp(cleanMobile, otp, expiresAt);
-        console.log(`[OTP SAVED] Mobile: ${cleanMobile}`);
+        console.log('[OTP] saved');
 
         // Send SMS via Nimbus
         await sendNimbusSms(cleanMobile, otp);
@@ -379,14 +427,14 @@ class UserAuthService {
         const otpRecord = await UserAuthModel.findOtp(cleanMobile, cleanOtp);
 
         if (!otpRecord) {
-            console.log(`[OTP VERIFY FAILED] Mobile: ${cleanMobile}, Reason: Invalid OTP`);
+            console.log('[OTP] verification failed: invalid code');
             const error = new Error('Invalid OTP');
             error.statusCode = 400;
             throw error;
         }
 
         if (new Date() > new Date(otpRecord.expires_at)) {
-            console.log(`[OTP VERIFY FAILED] Mobile: ${cleanMobile}, Reason: OTP Expired`);
+            console.log('[OTP] verification failed: expired code');
             const error = new Error('OTP has expired');
             error.statusCode = 400;
             throw error;
@@ -394,7 +442,7 @@ class UserAuthService {
 
         // Mark OTP as verified
         await UserAuthModel.markOtpVerified(otpRecord.id);
-        console.log(`[OTP VERIFY SUCCESS] Mobile: ${cleanMobile}`);
+        console.log('[OTP] verification succeeded');
 
         // Reuse devLogin logic to create or fetch user and generate token
         return this.devLogin({ mobile: cleanMobile });

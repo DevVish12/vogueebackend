@@ -1,5 +1,9 @@
+
+
+
 // const { verifyToken } = require('../utils/jwt');
 // const { errorResponse } = require('../utils/response');
+// const PartnerAuthModel = require('../modules/partnerAuth/partnerAuth.model');
 
 // const extractBearerToken = (authHeader) => {
 //     const raw = String(authHeader || '').trim();
@@ -81,7 +85,7 @@
 //     }
 // };
 
-// const partnerProtect = (req, res, next) => {
+// const partnerProtect = async (req, res, next) => {
 //     try {
 //         const authHeader = req.headers.authorization;
 //         const token = extractBearerToken(authHeader);
@@ -111,8 +115,13 @@
 //             return errorResponse(res, 403, 'Forbidden');
 //         }
 
+//         const partner = await PartnerAuthModel.findById(decoded.id);
+//         if (!partner) {
+//             return errorResponse(res, 401, 'Not authorized, token failed');
+//         }
+
 //         req.partner = decoded;
-//         next();
+//         return next();
 //     } catch (error) {
 //         return errorResponse(res, 401, 'Not authorized, token failed');
 //     }
@@ -144,12 +153,7 @@ const adminProtect = (req, res, next) => {
         const authHeader = req.headers.authorization;
         const token = extractBearerToken(authHeader);
 
-        if (process.env.NODE_ENV !== 'production') {
-            // eslint-disable-next-line no-console
-            console.log('[auth] authorization header:', authHeader);
-            // eslint-disable-next-line no-console
-            console.log('[auth] extracted token:', token);
-        }
+        if (process.env.NODE_ENV !== 'production') console.log('[AUTH] token present:', Boolean(token));
 
         if (!token) {
             return errorResponse(res, 401, 'Not authorized, no token provided');
@@ -158,7 +162,7 @@ const adminProtect = (req, res, next) => {
         const { decoded, error } = verifyToken(token, { detailed: true });
         if (process.env.NODE_ENV !== 'production' && error) {
             // eslint-disable-next-line no-console
-            console.log('[auth] JWT ERROR:', error.message);
+            console.log('[AUTH] JWT error:', error.message);
         }
 
         if (!decoded || !decoded.id) {
@@ -177,12 +181,7 @@ const userProtect = (req, res, next) => {
         const authHeader = req.headers.authorization;
         const token = extractBearerToken(authHeader);
 
-        if (process.env.NODE_ENV !== 'production') {
-            // eslint-disable-next-line no-console
-            console.log('[auth] authorization header:', authHeader);
-            // eslint-disable-next-line no-console
-            console.log('[auth] extracted token:', token);
-        }
+        if (process.env.NODE_ENV !== 'production') console.log('[AUTH] token present:', Boolean(token));
 
         if (!token) {
             return errorResponse(res, 401, 'Not authorized, no token provided');
@@ -191,7 +190,7 @@ const userProtect = (req, res, next) => {
         const { decoded, error } = verifyToken(token, { detailed: true });
         if (process.env.NODE_ENV !== 'production' && error) {
             // eslint-disable-next-line no-console
-            console.log('[auth] JWT ERROR:', error.message);
+            console.log('[AUTH] JWT error:', error.message);
         }
 
         if (!decoded || !decoded.id) {
@@ -210,12 +209,7 @@ const partnerProtect = async (req, res, next) => {
         const authHeader = req.headers.authorization;
         const token = extractBearerToken(authHeader);
 
-        if (process.env.NODE_ENV !== 'production') {
-            // eslint-disable-next-line no-console
-            console.log('[auth] authorization header:', authHeader);
-            // eslint-disable-next-line no-console
-            console.log('[auth] extracted token:', token);
-        }
+        if (process.env.NODE_ENV !== 'production') console.log('[AUTH] token present:', Boolean(token));
 
         if (!token) {
             return errorResponse(res, 401, 'Not authorized, no token provided');
@@ -224,7 +218,7 @@ const partnerProtect = async (req, res, next) => {
         const { decoded, error } = verifyToken(token, { detailed: true });
         if (process.env.NODE_ENV !== 'production' && error) {
             // eslint-disable-next-line no-console
-            console.log('[auth] JWT ERROR:', error.message);
+            console.log('[AUTH] JWT error:', error.message);
         }
 
         if (!decoded || !decoded.id) {

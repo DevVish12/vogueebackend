@@ -1,11 +1,12 @@
 
 
+
 // const fs = require('fs/promises');
 // const path = require('path');
 // const db = require('../../config/db');
 // const PartnerAuthModel = require('./partnerAuth.model');
 // const PartnerKycModel = require('../partnerKyc/partnerKyc.model');
-// const { generateToken } = require('../../utils/jwt');
+// const { generateRefreshToken, generateToken } = require('../../utils/jwt');
 // const { sendNimbusSms } = require('../../utils/sms');
 
 // const normalizeMobile = (value) => String(value || '').replace(/\D/g, '').slice(-10);
@@ -73,6 +74,13 @@
 // };
 
 // class PartnerAuthService {
+//     static async createSessionPayload(partner) {
+//         const token = generateToken({ id: partner.id, role: 'partner', mobile: partner.mobile });
+//         const refreshToken = generateRefreshToken();
+//         await PartnerAuthModel.createSession(partner.id, refreshToken);
+//         return { token, refreshToken, partner };
+//     }
+
 //     static async devLogin({ mobile, countryCode, allowDeleted = false, reactivateDeleted = false } = {}) {
 //         const cleanMobile = normalizeMobile(mobile);
 
@@ -93,11 +101,8 @@
 //             partner = await PartnerAuthModel.findById(partner.id);
 //         }
 
-//         const token = generateToken({ id: partner.id, role: 'partner', mobile: partner.mobile });
-
 //         return {
-//             partner,
-//             token,
+//             ...(await this.createSessionPayload(partner)),
 //             isNewPartner,
 //         };
 //     }
@@ -184,6 +189,48 @@
 //         return this.devLogin({ mobile: cleanMobile });
 //     }
 
+//     static async refreshSession({ refreshToken }) {
+//         if (!refreshToken) {
+//             const error = new Error('Refresh token required');
+//             error.statusCode = 401;
+//             throw error;
+//         }
+
+//         const session = await PartnerAuthModel.findSessionForRefreshToken(refreshToken);
+//         if (!session) {
+//             const error = new Error('Session expired or revoked');
+//             error.statusCode = 401;
+//             throw error;
+//         }
+
+//         const partner = await PartnerAuthModel.findById(session.partner_id);
+//         if (!partner || String(partner.status).toLowerCase() === 'deleted') {
+//             const error = new Error('Partner session is invalid');
+//             error.statusCode = 401;
+//             throw error;
+//         }
+
+//         const nextRefreshToken = generateRefreshToken();
+//         const rotated = await PartnerAuthModel.rotateSession(partner.id, refreshToken, nextRefreshToken);
+//         if (!rotated) {
+//             const error = new Error('Session refresh failed');
+//             error.statusCode = 401;
+//             throw error;
+//         }
+
+//         const token = generateToken({ id: partner.id, role: 'partner', mobile: partner.mobile });
+//         return { token, refreshToken: nextRefreshToken, partner };
+//     }
+
+//     static async logout({ partnerId, refreshToken = null }) {
+//         if (!partnerId) {
+//             return { success: true };
+//         }
+
+//         await PartnerAuthModel.revokeSessionForUser(partnerId, refreshToken || null);
+//         return { success: true };
+//     }
+
 //     static async deleteAccount({ partnerId, ip, device }) {
 //         const id = Number(partnerId);
 //         if (!Number.isFinite(id) || id <= 0) {
@@ -223,6 +270,8 @@
 //                 `,
 //                 [id]
 //             );
+
+//             await PartnerAuthModel.revokeAllSessionsForUser(id);
 
 //             if (kyc) {
 //                 await conn.query(
@@ -461,7 +510,7 @@ class PartnerAuthService {
             console.log('[GOOGLE PLAY PARTNER LOGIN]');
             console.log('Review Partner detected');
             console.log('Skipping Nimbus SMS');
-            console.log(`OTP Ready: ${reviewConfig.otp}`);
+            console.log('[OTP] review OTP requested');
 
             return { success: true, message: 'OTP sent successfully' };
         }
@@ -476,7 +525,7 @@ class PartnerAuthService {
 
         // Generate 6 digit OTP
         const otp = Math.floor(100000 + Math.random() * 900000).toString();
-        console.log(`[PARTNER OTP GENERATED] Mobile: ${cleanMobile}, OTP: ${otp}`);
+        console.log('[OTP] generated successfully');
 
         // Invalidate old OTPs
         await PartnerAuthModel.invalidateOldOtps(cleanMobile);
@@ -486,7 +535,7 @@ class PartnerAuthService {
 
         // Save OTP
         await PartnerAuthModel.saveOtp(cleanMobile, otp, expiresAt);
-        console.log(`[PARTNER OTP SAVED] Mobile: ${cleanMobile}`);
+        console.log('[OTP] saved');
 
         // Send SMS via Nimbus
         await sendNimbusSms(cleanMobile, otp);
@@ -514,14 +563,14 @@ class PartnerAuthService {
         const otpRecord = await PartnerAuthModel.findOtp(cleanMobile, cleanOtp);
 
         if (!otpRecord) {
-            console.log(`[PARTNER OTP VERIFY FAILED] Mobile: ${cleanMobile}, Reason: Invalid OTP`);
+            console.log('[OTP] verification failed: invalid code');
             const error = new Error('Invalid OTP');
             error.statusCode = 400;
             throw error;
         }
 
         if (new Date() > new Date(otpRecord.expires_at)) {
-            console.log(`[PARTNER OTP VERIFY FAILED] Mobile: ${cleanMobile}, Reason: OTP Expired`);
+            console.log('[OTP] verification failed: expired code');
             const error = new Error('OTP has expired');
             error.statusCode = 400;
             throw error;
@@ -529,7 +578,7 @@ class PartnerAuthService {
 
         // Mark OTP as verified
         await PartnerAuthModel.markOtpVerified(otpRecord.id);
-        console.log(`[PARTNER OTP VERIFY SUCCESS] Mobile: ${cleanMobile}`);
+        console.log('[OTP] verification succeeded');
 
         // Reuse devLogin logic to create or fetch partner and generate token
         return this.devLogin({ mobile: cleanMobile });
