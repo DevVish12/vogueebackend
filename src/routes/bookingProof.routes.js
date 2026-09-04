@@ -1,6 +1,5 @@
 
 
-
 // const express = require('express');
 // const path = require('path');
 // const fs = require('fs');
@@ -137,7 +136,7 @@
 //             return res.status(400).json({ success: false, message: 'otp is required' });
 //         }
 
-//         const [rows] = await db.query('SELECT id, service_otp, user_id, service_name, partner_id, booking_status FROM payments WHERE id = ?', [id]);
+//         const [rows] = await db.query('SELECT id, service_otp, user_id, service_name, partner_id, booking_status, booking_type, service_mode FROM payments WHERE id = ?', [id]);
 //         if (!rows || !rows.length) {
 //             return res.status(404).json({ success: false, message: 'Not found' });
 //         }
@@ -158,6 +157,8 @@
 //         }
 
 //         const booking = rows[0];
+//         const isSalonVisit = String(booking.booking_type || '').trim() === 'visit_salon'
+//             || String(booking.service_mode || '').trim() === 'visit_salon';
 //         const io = req.app.get('io');
 //         const completedPayload = { bookingId: id, status: 'completed', booking_status: 'completed' };
 //         if (io) {
@@ -177,10 +178,10 @@
 //                 void sendExpoNotification(
 //                     recipient.user_token,
 //                     'Service Completed',
-//                     'Your service has been completed successfully.',
+//                     isSalonVisit ? 'Your salon service has been completed.' : 'Your service has been completed successfully.',
 //                     { bookingId: id, screen: 'BookingHistory' },
 //                     {
-//                         type: 'SERVICE_COMPLETED',
+//                         type: isSalonVisit ? 'SALON_SERVICE_COMPLETED' : 'SERVICE_COMPLETED',
 //                         eventId: `booking_${id}_COMPLETED`,
 //                         recipientId: booking.user_id,
 //                         recipientRole: 'user',
@@ -258,7 +259,9 @@ router.post('/upload-proof', partnerProtect, upload.single('image'), async (req,
 
         // Verify booking belongs to authenticated partner
         const [bookingRows] = await db.query(
-            'SELECT id, partner_id, user_id, service_name FROM payments WHERE id = ?',
+            `SELECT id, partner_id, user_id, service_name,
+                    COALESCE(NULLIF(TRIM(booking_type), ''), NULLIF(TRIM(service_mode), ''), 'home') AS booking_type
+             FROM payments WHERE id = ?`,
             [id]
         );
 
@@ -328,6 +331,38 @@ router.post('/upload-proof', partnerProtect, upload.single('image'), async (req,
         } catch (err) {
             // eslint-disable-next-line no-console
             console.warn('[upload-proof] Failed to send notification:', err?.message || err);
+        }
+
+        try {
+            const bookingType = String(booking.booking_type || '').trim().toLowerCase();
+            if (['home', 'at_home', 'instant', 'near', 'scheduled'].includes(bookingType) && booking?.user_id) {
+                const [userRows] = await db.query(
+                    'SELECT expo_push_token FROM users WHERE id = ?',
+                    [booking.user_id]
+                );
+                const userToken = userRows?.[0]?.expo_push_token;
+                if (userToken) {
+                    void sendExpoNotification(
+                        userToken,
+                        'Your Service OTP',
+                        `Your OTP for ${booking.service_name} service is ${otp}. Share it with your partner to complete the service.`,
+                        {
+                            bookingId: booking.id,
+                            otp,
+                            screen: 'BookingDetails',
+                        },
+                        {
+                            type: 'SERVICE_OTP_GENERATED',
+                            eventId: `booking_${booking.id}_OTP_GENERATED_${otp}`,
+                            recipientId: booking.user_id,
+                            recipientRole: 'user',
+                        }
+                    ).catch(() => { });
+                }
+            }
+        } catch (err) {
+            // eslint-disable-next-line no-console
+            console.warn('[upload-proof] Failed to send OTP notification:', err?.message || err);
         }
 
         return res.json({ success: true });

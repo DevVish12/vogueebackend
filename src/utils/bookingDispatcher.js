@@ -1,3 +1,6 @@
+
+
+
 // const db = require('../config/db');
 // const PaymentModel = require('../modules/payment/payment.model');
 // const PartnerLocationModel = require('../modules/partnerLocation/partnerLocation.model');
@@ -132,8 +135,12 @@
 //         await PartnerLocationModel.ensureTable();
 //         const [rows] = await db.query(`
 //             SELECT pl.partner_id, pl.lat, pl.lng
-//       FROM partner_locations pl
-//     `);
+//             FROM partner_locations pl
+//             INNER JOIN partners p ON p.id = pl.partner_id
+//             WHERE LOWER(COALESCE(p.status, 'active')) NOT IN ('blocked', 'inactive', 'suspended', 'deleted')
+//                 AND LOWER(COALESCE(p.kyc_status, 'pending')) IN ('approved', 'verified')
+//                 AND p.online_status = 'ONLINE'
+//         `);
 //         partners = Array.isArray(rows) ? rows : [];
 //     } catch (_) {
 //         partners = [];
@@ -208,16 +215,21 @@
 //             const token = partner?.expo_push_token;
 
 //             if (token) {
-//                 await sendExpoNotification(
+//                 void sendExpoNotification(
 //                     token,
 //                     'New Booking Request',
-//                     `${bookingPayload.serviceName} - ${distance || 'Distance unknown'}`,
+//                     `New ${bookingPayload.serviceName || 'service'} booking available near you${distance ? ` (${distance})` : ''}.`,
 //                     {
-//                         bookingId: bookingPayload.id,
-//                         userId: bookingPayload.userId,
-//                         type: 'newBookingRequest',
+//                         bookingId: bookingPayload.bookingId,
+//                         screen: 'BookingRequest',
+//                     },
+//                     {
+//                         type: 'NEW_BOOKING',
+//                         eventId: `booking_${bookingPayload.bookingId}_NEW_BOOKING`,
+//                         recipientId: partnerId,
+//                         recipientRole: 'partner',
 //                     }
-//                 );
+//                 ).catch(() => { });
 //             }
 //         } catch (err) {
 //             // eslint-disable-next-line no-console
@@ -250,13 +262,17 @@
 const db = require('../config/db');
 const PaymentModel = require('../modules/payment/payment.model');
 const PartnerLocationModel = require('../modules/partnerLocation/partnerLocation.model');
-const { getIO, onlinePartners } = require('../../socket/socket');
+const { getIO, getPartnerSocketIds } = require('../../socket/socket');
 const { startBookingRetryInterval } = require('./bookingRetryManager');
 const { sendExpoNotification } = require('./sendExpoNotification');
 
 const toNumber = (v) => {
     const n = Number(v);
     return Number.isFinite(n) ? n : null;
+};
+
+const getPartnerSocketCount = (partnerId) => {
+    return getPartnerSocketIds(partnerId).length;
 };
 
 // Haversine distance in KM
@@ -429,27 +445,64 @@ const dispatchPaymentRow = async (paymentRow) => {
         return { ok: true, status: 'no_partner', reason: 'no_partners_in_radius' };
     }
 
-    const onlineNearbyPartners = nearbyPartners.filter((p) => onlinePartners.has(String(p?.partner_id)));
+    const onlineNearbyPartners = nearbyPartners.filter((p) => getPartnerSocketCount(p?.partner_id) > 0);
 
-    // Send booking requests to online nearby partners
-    for (const p of onlineNearbyPartners) {
+    if (process.env.NODE_ENV !== 'production') {
+        // eslint-disable-next-line no-console
+        console.log('[DISPATCH]', {
+            bookingId,
+            eligiblePartnersCount: nearbyPartners.length,
+            candidatePartnerIds: nearbyPartners.map((p) => p?.partner_id),
+            onlinePartnerIds: onlineNearbyPartners.map((p) => p?.partner_id),
+            socketClientsFound: onlineNearbyPartners.reduce(
+                (total, p) => total + getPartnerSocketCount(p?.partner_id),
+                0
+            ),
+        });
+    }
+
+    // Send the socket request only to partners with a live room; keep push as fallback.
+    for (const p of nearbyPartners) {
         const partnerId = p?.partner_id;
         if (partnerId == null) continue;
 
         const distanceKm = Number(p?.distanceKm);
         const distance = Number.isFinite(distanceKm) ? `${distanceKm.toFixed(1)} km` : undefined;
 
-        io.to(`partner:${partnerId}`).emit('newBookingRequest', {
-            ...bookingPayload,
-            expiresIn: EXPIRES_IN_SEC,
-            distanceKm: Number.isFinite(distanceKm) ? distanceKm : undefined,
-            distance,
-        });
+        if (getPartnerSocketCount(partnerId) > 0) {
+            const socketIds = getPartnerSocketIds(partnerId);
+            io.to(`partner:${partnerId}`).emit('newBookingRequest', {
+                ...bookingPayload,
+                expiresIn: EXPIRES_IN_SEC,
+                distanceKm: Number.isFinite(distanceKm) ? distanceKm : undefined,
+                distance,
+            });
 
-        io.emit('new_booking', {
-            ...bookingPayload,
-            bookingType: bookingPayload.bookingType,
-        });
+            io.emit('new_booking', {
+                ...bookingPayload,
+                bookingType: bookingPayload.bookingType,
+            });
+
+            if (process.env.NODE_ENV !== 'production') {
+                // eslint-disable-next-line no-console
+                console.log('[DISPATCH]', {
+                    bookingId,
+                    partnerId,
+                    socketId: socketIds.join(','),
+                    socketConnected: true,
+                    socketDelivered: true,
+                });
+            }
+        } else if (process.env.NODE_ENV !== 'production') {
+            // eslint-disable-next-line no-console
+            console.log('[DISPATCH]', {
+                bookingId,
+                partnerId,
+                socketId: null,
+                socketConnected: false,
+                socketDelivered: false,
+            });
+        }
 
         // Send Expo push notification (background/foreground delivery)
         try {
@@ -489,7 +542,6 @@ const dispatchPaymentRow = async (paymentRow) => {
         userId,
         bookingPayload,
         nearbyPartners,
-        onlinePartners,
         io,
         db,
         intervalMs: 15000,
@@ -497,9 +549,55 @@ const dispatchPaymentRow = async (paymentRow) => {
         expiresInSec: EXPIRES_IN_SEC,
     });
 
-    return { ok: true, status: 'searching', nearbyPartners: nearbyPartners.length, onlineNearbyPartners: onlineNearbyPartners.length };
+    return {
+        ok: true,
+        status: 'searching',
+        nearbyPartners: nearbyPartners.length,
+        onlineNearbyPartners: onlineNearbyPartners.length,
+        socketDelivered: onlineNearbyPartners.length > 0,
+    };
+};
+
+const dispatchPaymentRowOnce = async (paymentId) => {
+    const id = Number(paymentId);
+    if (!Number.isFinite(id)) return { ok: false, reason: 'invalid_payment_id' };
+
+    const [claim] = await db.query(
+        'UPDATE payments SET dispatched = 2 WHERE id = ? AND dispatched = 0',
+        [id]
+    );
+
+    if (!Number(claim?.affectedRows || 0)) {
+        return { ok: false, reason: 'already_claimed_or_dispatched' };
+    }
+
+    try {
+        const booking = await PaymentModel.getById(id);
+        if (!booking) throw new Error(`Payment not found: ${id}`);
+
+        const result = await dispatchPaymentRow(booking);
+        const socketDelivered = result?.socketDelivered === true;
+        const keepingForRetry = result?.status === 'searching' && !socketDelivered;
+        await db.query(
+            'UPDATE payments SET dispatched = ?, booking_status = ? WHERE id = ?',
+            [keepingForRetry ? 0 : 1, keepingForRetry ? 'pending' : result?.status, id]
+        );
+        if (process.env.NODE_ENV !== 'production') {
+            // eslint-disable-next-line no-console
+            console.log('[DISPATCH] keeping booking for retry:', {
+                bookingId: booking.booking_id ?? booking.id,
+                socketDelivered,
+                keepingForRetry,
+            });
+        }
+        return result;
+    } catch (err) {
+        await db.query('UPDATE payments SET dispatched = 0 WHERE id = ? AND dispatched = 2', [id]);
+        throw err;
+    }
 };
 
 module.exports = {
     dispatchPaymentRow,
+    dispatchPaymentRowOnce,
 };

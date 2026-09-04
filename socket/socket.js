@@ -77,6 +77,21 @@
 //     return Boolean(bucket && bucket.size > 0);
 // };
 
+// const getPartnerSocketIds = (partnerId) => {
+//     const pid = normalizeRoomId(partnerId);
+//     if (!pid) return [];
+
+//     const bucket = partnerSockets.get(pid);
+//     if (!bucket) return [];
+
+//     const activeSocketIds = [...bucket].filter((socketId) => io?.sockets?.sockets?.get(socketId)?.connected);
+//     if (activeSocketIds.length !== bucket.size) {
+//         if (activeSocketIds.length) partnerSockets.set(pid, new Set(activeSocketIds));
+//         else partnerSockets.delete(pid);
+//     }
+//     return activeSocketIds;
+// };
+
 // const markPartnerAvailable = (partnerId) => {
 //     const pid = normalizeRoomId(partnerId);
 //     if (!pid) return;
@@ -324,7 +339,9 @@
 //             socket.join(toPartnerRoom(nextPartner));
 
 //             addPartnerSocket(nextPartner, socket.id);
-//             await syncPartnerPresenceWithDb(nextPartner);
+//             syncPartnerPresenceWithDb(nextPartner).catch(() => {
+//                 // Presence status must not decide whether socket registration succeeds.
+//             });
 
 //             if (process.env.NODE_ENV !== 'production') {
 //                 // eslint-disable-next-line no-console
@@ -382,21 +399,70 @@
 //             }
 //         });
 
-//         socket.on('registerPartner', (payload = {}) => {
+//         socket.on('registerPartner', async (payload = {}, ack) => {
 //             const data = payload && typeof payload === 'object' ? payload : { partnerId: payload };
 //             const nextPartnerId = data?.partnerId;
 //             const token = typeof data?.token === 'string' ? data.token.trim() : '';
 
-//             if (token) {
-//                 const { decoded } = verifyToken(token, { detailed: true });
-//                 if (!decoded?.id) return;
-//                 if (String(decoded.id) !== String(nextPartnerId)) return;
-//                 if (decoded.role && decoded.role !== 'partner') return;
-//             }
-
-//             registerPartnerRoom(nextPartnerId).catch(() => {
-//                 // ignore
+//             // eslint-disable-next-line no-console
+//             console.log('[socket-debug] REGISTER_RECEIVED', {
+//                 socketId: socket.id,
+//                 partnerId: nextPartnerId == null ? null : String(nextPartnerId),
+//                 hasToken: Boolean(token),
 //             });
+
+//             const sendAck = (result) => {
+//                 if (typeof ack !== 'function') return;
+//                 ack(result);
+//                 // eslint-disable-next-line no-console
+//                 console.log('[socket-debug] REGISTER_ACK_SENT', {
+//                     socketId: socket.id,
+//                     partnerId: result?.partnerId ?? (nextPartnerId == null ? null : String(nextPartnerId)),
+//                     ok: result?.ok === true,
+//                 });
+//             };
+
+//             const rejectRegistration = (reason) => {
+//                 // eslint-disable-next-line no-console
+//                 console.log('[socket-debug] REGISTER_REJECTED', {
+//                     socketId: socket.id,
+//                     partnerId: nextPartnerId == null ? null : String(nextPartnerId),
+//                     reason,
+//                 });
+//                 sendAck({ ok: false, partnerId: null, reason });
+//             };
+
+//             try {
+//                 const normalizedPartnerId = normalizeRoomId(nextPartnerId);
+//                 if (!normalizedPartnerId) return rejectRegistration('MISSING_PARTNER_ID');
+//                 if (!token) return rejectRegistration('MISSING_TOKEN');
+
+//                 const { decoded } = verifyToken(token, { detailed: true });
+//                 if (!decoded?.id) return rejectRegistration('INVALID_TOKEN');
+//                 if (decoded.role !== 'partner') return rejectRegistration('INVALID_ROLE');
+//                 // Compare the client payload only with the authenticated partner identity.
+//                 console.log('[REGISTER IDENTITY DEBUG]', {
+//                     payloadPartnerId: nextPartnerId == null ? null : nextPartnerId,
+//                     payloadPartnerIdType: typeof nextPartnerId,
+//                     jwtId: decoded.id,
+//                     jwtIdType: typeof decoded.id,
+//                 });
+//                 if (String(decoded.id) !== normalizedPartnerId) return rejectRegistration('PARTNER_ID_MISMATCH');
+
+//                 let partner;
+//                 try {
+//                     partner = await PartnerAuthModel.findById(normalizedPartnerId);
+//                 } catch {
+//                     return rejectRegistration('DATABASE_LOOKUP_FAILED');
+//                 }
+//                 if (!partner?.id) return rejectRegistration('PARTNER_NOT_FOUND');
+
+//                 const joined = await registerPartnerRoom(normalizedPartnerId);
+//                 if (!joined) return rejectRegistration('ROOM_REGISTRATION_FAILED');
+//                 sendAck({ ok: Boolean(joined), partnerId: joined });
+//             } catch {
+//                 rejectRegistration('UNKNOWN_ERROR');
+//             }
 //         });
 
 //         // Admin dashboard registration (token-verified). Additive; safe for existing clients.
@@ -653,7 +719,8 @@
 //                 };
 
 //                 const pushConfig = notificationMap[nextStatus];
-//                 if (pushConfig) {
+//                 const shouldNotifyCompletion = nextStatus !== 'completed' || String(row.booking_status || '').trim() !== 'completed';
+//                 if (pushConfig && shouldNotifyCompletion) {
 //                     try {
 //                         const [userRows] = await db.query('SELECT expo_push_token FROM users WHERE id = ?', [row.user_id]);
 //                         const userToken = userRows?.[0]?.expo_push_token;
@@ -667,7 +734,17 @@
 //                                 {
 //                                     bookingId: row.id,
 //                                     partnerId: row.partner_id ?? null,
-//                                     type: pushConfig.type,
+//                                     type: nextStatus === 'completed' && isSalonVisit
+//                                         ? 'SALON_SERVICE_COMPLETED'
+//                                         : pushConfig.type,
+//                                 },
+//                                 {
+//                                     type: nextStatus === 'completed' && isSalonVisit
+//                                         ? 'SALON_SERVICE_COMPLETED'
+//                                         : 'SERVICE_COMPLETED',
+//                                     eventId: `booking_${row.id}_COMPLETED`,
+//                                     recipientId: row.user_id,
+//                                     recipientRole: 'user',
 //                                 }
 //                             );
 //                         }
@@ -742,6 +819,7 @@
 // module.exports = {
 //     attachSocket,
 //     getIO,
+//     getPartnerSocketIds,
 //     onlinePartners,
 //     markPartnerAvailable,
 //     markPartnerUnavailable,
@@ -824,6 +902,21 @@ const isPartnerConnected = (partnerId) => {
 
     const bucket = partnerSockets.get(pid);
     return Boolean(bucket && bucket.size > 0);
+};
+
+const getPartnerSocketIds = (partnerId) => {
+    const pid = normalizeRoomId(partnerId);
+    if (!pid) return [];
+
+    const bucket = partnerSockets.get(pid);
+    if (!bucket) return [];
+
+    const activeSocketIds = [...bucket].filter((socketId) => io?.sockets?.sockets?.get(socketId)?.connected);
+    if (activeSocketIds.length !== bucket.size) {
+        if (activeSocketIds.length) partnerSockets.set(pid, new Set(activeSocketIds));
+        else partnerSockets.delete(pid);
+    }
+    return activeSocketIds;
 };
 
 const markPartnerAvailable = (partnerId) => {
@@ -1073,7 +1166,9 @@ const attachSocket = (httpServer) => {
             socket.join(toPartnerRoom(nextPartner));
 
             addPartnerSocket(nextPartner, socket.id);
-            await syncPartnerPresenceWithDb(nextPartner);
+            syncPartnerPresenceWithDb(nextPartner).catch(() => {
+                // Presence status must not decide whether socket registration succeeds.
+            });
 
             if (process.env.NODE_ENV !== 'production') {
                 // eslint-disable-next-line no-console
@@ -1131,21 +1226,70 @@ const attachSocket = (httpServer) => {
             }
         });
 
-        socket.on('registerPartner', (payload = {}) => {
+        socket.on('registerPartner', async (payload = {}, ack) => {
             const data = payload && typeof payload === 'object' ? payload : { partnerId: payload };
             const nextPartnerId = data?.partnerId;
             const token = typeof data?.token === 'string' ? data.token.trim() : '';
 
-            if (token) {
-                const { decoded } = verifyToken(token, { detailed: true });
-                if (!decoded?.id) return;
-                if (String(decoded.id) !== String(nextPartnerId)) return;
-                if (decoded.role && decoded.role !== 'partner') return;
-            }
-
-            registerPartnerRoom(nextPartnerId).catch(() => {
-                // ignore
+            // eslint-disable-next-line no-console
+            console.log('[socket-debug] REGISTER_RECEIVED', {
+                socketId: socket.id,
+                partnerId: nextPartnerId == null ? null : String(nextPartnerId),
+                hasToken: Boolean(token),
             });
+
+            const sendAck = (result) => {
+                if (typeof ack !== 'function') return;
+                ack(result);
+                // eslint-disable-next-line no-console
+                console.log('[socket-debug] REGISTER_ACK_SENT', {
+                    socketId: socket.id,
+                    partnerId: result?.partnerId ?? (nextPartnerId == null ? null : String(nextPartnerId)),
+                    ok: result?.ok === true,
+                });
+            };
+
+            const rejectRegistration = (reason) => {
+                // eslint-disable-next-line no-console
+                console.log('[socket-debug] REGISTER_REJECTED', {
+                    socketId: socket.id,
+                    partnerId: nextPartnerId == null ? null : String(nextPartnerId),
+                    reason,
+                });
+                sendAck({ ok: false, partnerId: null, reason });
+            };
+
+            try {
+                const normalizedPartnerId = normalizeRoomId(nextPartnerId);
+                if (!normalizedPartnerId) return rejectRegistration('MISSING_PARTNER_ID');
+                if (!token) return rejectRegistration('MISSING_TOKEN');
+
+                const { decoded } = verifyToken(token, { detailed: true });
+                if (!decoded?.id) return rejectRegistration('INVALID_TOKEN');
+                if (decoded.role !== 'partner') return rejectRegistration('INVALID_ROLE');
+                // Compare the client payload only with the authenticated partner identity.
+                console.log('[REGISTER IDENTITY DEBUG]', {
+                    payloadPartnerId: nextPartnerId == null ? null : nextPartnerId,
+                    payloadPartnerIdType: typeof nextPartnerId,
+                    jwtId: decoded.id,
+                    jwtIdType: typeof decoded.id,
+                });
+                if (String(decoded.id) !== normalizedPartnerId) return rejectRegistration('PARTNER_ID_MISMATCH');
+
+                let partner;
+                try {
+                    partner = await PartnerAuthModel.findById(normalizedPartnerId);
+                } catch {
+                    return rejectRegistration('DATABASE_LOOKUP_FAILED');
+                }
+                if (!partner?.id) return rejectRegistration('PARTNER_NOT_FOUND');
+
+                const joined = await registerPartnerRoom(normalizedPartnerId);
+                if (!joined) return rejectRegistration('ROOM_REGISTRATION_FAILED');
+                sendAck({ ok: Boolean(joined), partnerId: joined });
+            } catch {
+                rejectRegistration('UNKNOWN_ERROR');
+            }
         });
 
         // Admin dashboard registration (token-verified). Additive; safe for existing clients.
@@ -1410,22 +1554,53 @@ const attachSocket = (httpServer) => {
                         if (!userToken) {
                             console.warn('[PUSH] No Expo Push Token Found');
                         } else {
+                            const salonPushConfig = {
+                                arrived: {
+                                    title: 'Customer Arrived',
+                                    body: 'Customer has arrived at the salon.',
+                                    type: 'SALON_CUSTOMER_ARRIVED',
+                                },
+                                reached: {
+                                    title: 'Customer Arrived',
+                                    body: 'Customer has arrived at the salon.',
+                                    type: 'SALON_CUSTOMER_ARRIVED',
+                                },
+                                service_started: {
+                                    title: 'Service Started',
+                                    body: 'Your salon service has started.',
+                                    type: 'SALON_SERVICE_STARTED',
+                                },
+                                in_service: {
+                                    title: 'Service Started',
+                                    body: 'Your salon service has started.',
+                                    type: 'SALON_SERVICE_STARTED',
+                                },
+                                completed: {
+                                    title: 'Service Completed',
+                                    body: 'Your salon service is completed.',
+                                    type: 'SALON_SERVICE_COMPLETED',
+                                },
+                            }[nextStatus];
+                            const notification = isSalonVisit ? salonPushConfig : pushConfig;
+                            const notificationType = notification?.type || pushConfig.type;
+                            const deliveryType = isSalonVisit ? notificationType : 'SERVICE_COMPLETED';
+                            const deliveryEventId = isSalonVisit
+                                ? `booking_${row.id}_${nextStatus}`
+                                : `booking_${row.id}_COMPLETED`;
                             await sendExpoNotification(
                                 userToken,
-                                pushConfig.title,
-                                pushConfig.body,
+                                notification.title,
+                                notification.body,
                                 {
-                                    bookingId: row.id,
+                                    bookingId: isSalonVisit ? String(row.booking_id) : row.id,
                                     partnerId: row.partner_id ?? null,
-                                    type: nextStatus === 'completed' && isSalonVisit
-                                        ? 'SALON_SERVICE_COMPLETED'
-                                        : pushConfig.type,
+                                    type: notificationType,
                                 },
                                 {
-                                    type: nextStatus === 'completed' && isSalonVisit
-                                        ? 'SALON_SERVICE_COMPLETED'
-                                        : 'SERVICE_COMPLETED',
-                                    eventId: `booking_${row.id}_COMPLETED`,
+                                    type: deliveryType,
+                                    eventId: isSalonVisit
+                                        ? `booking_${String(row.booking_id)}_${nextStatus}`
+                                        : deliveryEventId,
                                     recipientId: row.user_id,
                                     recipientRole: 'user',
                                 }
@@ -1502,6 +1677,7 @@ const getIO = () => {
 module.exports = {
     attachSocket,
     getIO,
+    getPartnerSocketIds,
     onlinePartners,
     markPartnerAvailable,
     markPartnerUnavailable,

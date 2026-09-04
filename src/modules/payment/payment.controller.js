@@ -8,6 +8,7 @@
 // const ServiceModel = require('../service/service.model');
 // const db = require('../../config/db');
 // const { getIO } = require('../../../socket/socket');
+// const { sendExpoNotification } = require('../../utils/sendExpoNotification');
 
 // const round2 = (value) => {
 //     const n = Number(value);
@@ -431,7 +432,18 @@
 
 //         const lat = booking_type === 'visit_salon' && Number.isFinite(salonLat) ? salonLat : userLat;
 //         const lng = booking_type === 'visit_salon' && Number.isFinite(salonLng) ? salonLng : userLng;
-//         const partnerId = bookingData?.partnerId ?? bookingData?.partner_id ?? null;
+//         let partnerId = bookingData?.partnerId ?? bookingData?.partner_id ?? null;
+
+//         if (isSalonVisit && salonId != null) {
+//             const [salonRows] = await db.query(
+//                 `SELECT partner_id
+//                  FROM partner_kyc
+//                  WHERE id = ? AND partner_type = 'partner_salon_owner'
+//                  LIMIT 1`,
+//                 [salonId]
+//             );
+//             partnerId = salonRows?.[0]?.partner_id ?? null;
+//         }
 
 //         console.log('[STEP 3] BEFORE PAYMENT SAVE');
 
@@ -471,6 +483,35 @@
 //         console.log('[PAYMENT] saved:', { paymentId: createdPayment?.id, userId: createdPayment?.userId });
 
 //         console.log('[STEP 4] PAYMENT SAVED');
+
+//         if (isSalonVisit && partnerId != null) {
+//             try {
+//                 const [partnerRows] = await db.query(
+//                     'SELECT expo_push_token FROM partners WHERE id = ?',
+//                     [partnerId]
+//                 );
+//                 const partnerToken = partnerRows?.[0]?.expo_push_token;
+//                 if (partnerToken) {
+//                     void sendExpoNotification(
+//                         partnerToken,
+//                         'New Salon Appointment',
+//                         'New appointment received at your salon.',
+//                         {
+//                             bookingId: createdPayment.id,
+//                             type: 'SALON_BOOKING',
+//                         },
+//                         {
+//                             type: 'SALON_BOOKING',
+//                             eventId: `booking_${createdPayment.id}_SALON_BOOKING`,
+//                             recipientId: partnerId,
+//                             recipientRole: 'partner',
+//                         }
+//                     ).catch(() => { });
+//                 }
+//             } catch (notificationError) {
+//                 console.warn('[payment] Failed to send salon booking notification:', notificationError?.message || notificationError);
+//             }
+//         }
 
 //         console.log('[STEP 5] BEFORE BOOKING UPDATE');
 
@@ -746,9 +787,11 @@
 //     }
 // };
 
+
 const Razorpay = require('razorpay');
 const crypto = require('crypto');
 const PaymentModel = require('./payment.model');
+const { dispatchPaymentRowOnce } = require('../../utils/bookingDispatcher');
 const CouponController = require('../coupon/coupon.controller');
 const CouponModel = require('../coupon/coupon.model');
 const ServiceModel = require('../service/service.model');
@@ -1229,6 +1272,21 @@ exports.verifyPayment = async (req, res) => {
         console.log('[PAYMENT] saved:', { paymentId: createdPayment?.id, userId: createdPayment?.userId });
 
         console.log('[STEP 4] PAYMENT SAVED');
+
+        if (booking_type === 'instant' && createdPayment?.id) {
+            console.log('[instant-dispatch] starting immediate dispatch:', createdPayment.id);
+            void dispatchPaymentRowOnce(createdPayment.id)
+                .then((result) => {
+                    console.log('[instant-dispatch] completed:', {
+                        paymentId: createdPayment.id,
+                        status: result?.status,
+                        reason: result?.reason || null,
+                    });
+                })
+                .catch((err) => {
+                    console.error('[instant-dispatch] failed:', createdPayment.id, err?.message || err);
+                });
+        }
 
         if (isSalonVisit && partnerId != null) {
             try {
