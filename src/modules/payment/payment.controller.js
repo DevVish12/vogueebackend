@@ -3,6 +3,7 @@
 // const Razorpay = require('razorpay');
 // const crypto = require('crypto');
 // const PaymentModel = require('./payment.model');
+// const { dispatchPaymentRowOnce } = require('../../utils/bookingDispatcher');
 // const CouponController = require('../coupon/coupon.controller');
 // const CouponModel = require('../coupon/coupon.model');
 // const ServiceModel = require('../service/service.model');
@@ -483,6 +484,21 @@
 //         console.log('[PAYMENT] saved:', { paymentId: createdPayment?.id, userId: createdPayment?.userId });
 
 //         console.log('[STEP 4] PAYMENT SAVED');
+
+//         if (booking_type === 'instant' && createdPayment?.id) {
+//             console.log('[instant-dispatch] starting immediate dispatch:', createdPayment.id);
+//             void dispatchPaymentRowOnce(createdPayment.id)
+//                 .then((result) => {
+//                     console.log('[instant-dispatch] completed:', {
+//                         paymentId: createdPayment.id,
+//                         status: result?.status,
+//                         reason: result?.reason || null,
+//                     });
+//                 })
+//                 .catch((err) => {
+//                     console.error('[instant-dispatch] failed:', createdPayment.id, err?.message || err);
+//                 });
+//         }
 
 //         if (isSalonVisit && partnerId != null) {
 //             try {
@@ -1168,6 +1184,7 @@ exports.verifyPayment = async (req, res) => {
         const slotTime = bookingData?.time ?? bookingData?.slotTime ?? null;
         const bookingTypeHint = String(bookingData?.bookingType ?? bookingData?.booking_type ?? '').trim();
         const serviceModeHint = String(bookingData?.serviceMode ?? bookingData?.service_mode ?? '').trim();
+        const bookingIntent = String(bookingData?.bookingIntent ?? bookingData?.booking_intent ?? '').trim();
         const salonId = bookingData?.salonId ?? bookingData?.salon_id ?? null;
         const salonName = bookingData?.salonName ?? bookingData?.salon_name ?? null;
         const salonAddress = bookingData?.salonAddress ?? bookingData?.salon_address ?? null;
@@ -1175,19 +1192,27 @@ exports.verifyPayment = async (req, res) => {
         const salonLng = Number(bookingData?.salonLng ?? bookingData?.salon_lng ?? bookingData?.lng ?? req.body.lng);
         const address = bookingData?.address ?? salonAddress ?? null;
 
-        const bookingDateTime = parseSlotDateTime(slotDate, slotTime);
-        if (!bookingDateTime) {
-            console.log('[STEP 2A] EARLY RETURN: INVALID SLOT DATE/TIME');
-            return res.status(400).json({ success: false, error: 'Invalid slot date/time' });
-        }
-
+        const isExplicitInstantAtHome = bookingIntent === 'instant'
+            && serviceModeHint === 'at_home'
+            && bookingTypeHint === 'at_home';
         const now = new Date();
-        const diffMs = bookingDateTime - now;
-        const diffMinutes = diffMs / (1000 * 60);
+        let bookingDateTime = null;
+        let diffMinutes = null;
 
-        if (diffMinutes < 0) {
-            console.log('[STEP 2B] EARLY RETURN: INVALID PAST BOOKING');
-            return res.status(400).json({ success: false, error: 'Invalid past booking' });
+        if (!isExplicitInstantAtHome) {
+            bookingDateTime = parseSlotDateTime(slotDate, slotTime);
+            if (!bookingDateTime) {
+                console.log('[STEP 2A] EARLY RETURN: INVALID SLOT DATE/TIME');
+                return res.status(400).json({ success: false, error: 'Invalid slot date/time' });
+            }
+
+            const diffMs = bookingDateTime - now;
+            diffMinutes = diffMs / (1000 * 60);
+
+            if (diffMinutes < 0) {
+                console.log('[STEP 2B] EARLY RETURN: INVALID PAST BOOKING');
+                return res.status(400).json({ success: false, error: 'Invalid past booking' });
+            }
         }
 
         let booking_type = '';
@@ -1200,6 +1225,8 @@ exports.verifyPayment = async (req, res) => {
             booking_type = 'visit_salon';
             service_mode = 'visit_salon';
             booking_status = 'confirmed';
+        } else if (isExplicitInstantAtHome) {
+            booking_type = 'instant';
         } else if (diffMinutes <= 30) {
             booking_type = 'instant';
         } else if (diffMinutes <= 180) {
@@ -1207,6 +1234,13 @@ exports.verifyPayment = async (req, res) => {
         } else {
             booking_type = 'scheduled';
         }
+
+        console.log('[payment] booking classification:', {
+            bookingIntent,
+            serviceMode: serviceModeHint,
+            bookingType: booking_type,
+            immediateDispatch: booking_type === 'instant',
+        });
 
         let dispatch_time;
         if (booking_type === 'instant') {
